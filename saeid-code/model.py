@@ -1,6 +1,35 @@
 import torch
-import math
 import torch.nn as nn
+import math
+
+class LayerNormalization(nn.Module):
+
+    def __init__(self, features: int, eps:float=10**-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.alpha = nn.Parameter(torch.ones(features)) # alpha is a learnable parameter
+        self.bias = nn.Parameter(torch.zeros(features)) # bias is a learnable parameter
+
+    def forward(self, x):
+        # x: (batch, seq_len, hidden_size)
+         # Keep the dimension for broadcasting
+        mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
+        # Keep the dimension for broadcasting
+        std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
+        # eps is to prevent dividing by zero or when std is very small
+        return self.alpha * (x - mean) / (std + self.eps) + self.bias
+
+class FeedForwardBlock(nn.Module):
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
+        super().__init__()
+        self.linear_1 = nn.Linear(d_model, d_ff) # w1 and b1
+        self.dropout = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(d_ff, d_model) # w2 and b2
+
+    def forward(self, x):
+        # (batch, seq_len, d_model) --> (batch, seq_len, d_ff) --> (batch, seq_len, d_model)
+        return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
 
 class InputEmbeddings(nn.Module):
 
@@ -14,7 +43,7 @@ class InputEmbeddings(nn.Module):
         # (batch, seq_len) --> (batch, seq_len, d_model)
         # Multiply by sqrt(d_model) to scale the embeddings according to the paper
         return self.embedding(x) * math.sqrt(self.d_model)
-
+    
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
@@ -41,37 +70,15 @@ class PositionalEncoding(nn.Module):
         x = x + (self.pe[:, :x.shape[1], :]).requires_grad_(False) # (batch, seq_len, d_model)
         return self.dropout(x)
 
-
-class LayerNormalization(nn.Module):
-
-    def __init__(self, features: int, eps:float=10**-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.alpha = nn.Parameter(torch.ones(features)) # alpha is a learnable parameter
-        self.bias = nn.Parameter(torch.zeros(features)) # bias is a learnable parameter
-
-    def forward(self, x):
-        # x: (batch, seq_len, hidden_size)
-         # Keep the dimension for broadcasting
-        mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # Keep the dimension for broadcasting
-        std = x.std(dim = -1, keepdim = True) # (batch, seq_len, 1)
-        # eps is to prevent dividing by zero or when std is very small
-        return self.alpha * (x - mean) / (std + self.eps) + self.bias
-
-
-class FeedForwardBlock(nn.Module):
-
-    def __init__(self, d_model: int, d_ff: int, dropout: float) -> None:
-        super().__init__()
-        self.linear_1 = nn.Linear(d_model, d_ff) # w1 and b1
-        self.dropout = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(d_ff, d_model) # w2 and b2
-
-    def forward(self, x):
-        # (batch, seq_len, d_model) --> (batch, seq_len, d_ff) --> (batch, seq_len, d_model)
-        return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
-
+class ResidualConnection(nn.Module):
+    
+        def __init__(self, features: int, dropout: float) -> None:
+            super().__init__()
+            self.dropout = nn.Dropout(dropout)
+            self.norm = LayerNormalization(features)
+    
+        def forward(self, x, sublayer):
+            return x + self.dropout(sublayer(self.norm(x)))
 
 class MultiHeadAttentionBlock(nn.Module):
 
@@ -126,16 +133,6 @@ class MultiHeadAttentionBlock(nn.Module):
         # (batch, seq_len, d_model) --> (batch, seq_len, d_model)  
         return self.w_o(x)
 
-
-class ResidualConnection(nn.Module):
-    def __init__(self, dropout: float) -> None:
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        self.norm = LayerNormalization()
-
-    def forward(self, x, sublayer):
-        return x + self.dropout(sublayer(self.norm(x)))
-
 class EncoderBlock(nn.Module):
 
     def __init__(self, features: int, self_attention_block: MultiHeadAttentionBlock, feed_forward_block: FeedForwardBlock, dropout: float) -> None:
@@ -148,7 +145,7 @@ class EncoderBlock(nn.Module):
         x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
         x = self.residual_connections[1](x, self.feed_forward_block)
         return x
-
+    
 class Encoder(nn.Module):
 
     def __init__(self, features: int, layers: nn.ModuleList) -> None:
@@ -175,7 +172,7 @@ class DecoderBlock(nn.Module):
         x = self.residual_connections[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
         x = self.residual_connections[2](x, self.feed_forward_block)
         return x
-
+    
 class Decoder(nn.Module):
 
     def __init__(self, features: int, layers: nn.ModuleList) -> None:
@@ -188,17 +185,6 @@ class Decoder(nn.Module):
             x = layer(x, encoder_output, src_mask, tgt_mask)
         return self.norm(x)
 
-# class ProjectionLayer(nn.Module):
-
-#     def __init__(self, d_model: int, vocab_size: int) -> None:
-#         super().__init__()
-#         self.proj = nn.Linear(d_model, vocab_size)
-
-#     def forward(self, x):
-#         # TODO differnt from the video code
-#         return torch.log_softmax(self.proj(x), dim = -1)
-
-
 class ProjectionLayer(nn.Module):
 
     def __init__(self, d_model, vocab_size) -> None:
@@ -208,8 +194,9 @@ class ProjectionLayer(nn.Module):
     def forward(self, x) -> None:
         # (batch, seq_len, d_model) --> (batch, seq_len, vocab_size)
         return self.proj(x)
-
+    
 class Transformer(nn.Module):
+
     def __init__(self, encoder: Encoder, decoder: Decoder, src_embed: InputEmbeddings, tgt_embed: InputEmbeddings, src_pos: PositionalEncoding, tgt_pos: PositionalEncoding, projection_layer: ProjectionLayer) -> None:
         super().__init__()
         self.encoder = encoder
@@ -221,18 +208,21 @@ class Transformer(nn.Module):
         self.projection_layer = projection_layer
 
     def encode(self, src, src_mask):
+        # (batch, seq_len, d_model)
         src = self.src_embed(src)
         src = self.src_pos(src)
         return self.encoder(src, src_mask)
-
+    
     def decode(self, encoder_output: torch.Tensor, src_mask: torch.Tensor, tgt: torch.Tensor, tgt_mask: torch.Tensor):
+        # (batch, seq_len, d_model)
         tgt = self.tgt_embed(tgt)
         tgt = self.tgt_pos(tgt)
         return self.decoder(tgt, encoder_output, src_mask, tgt_mask)
-
+    
     def project(self, x):
+        # (batch, seq_len, vocab_size)
         return self.projection_layer(x)
-
+    
 def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int, tgt_seq_len: int, d_model: int=512, N: int=6, h: int=8, dropout: float=0.1, d_ff: int=2048) -> Transformer:
     # Create the embedding layers
     src_embed = InputEmbeddings(d_model, src_vocab_size)
